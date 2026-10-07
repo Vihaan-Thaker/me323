@@ -5,6 +5,8 @@ Then we need a helmet (https://grabcad.com/library/dr-bike-helmet)...
 
 The idea is the put the helmet on top of the head, with some space in between the head and the helmet, ie some tunable offset.
 
+The current WSL viewer automatically scales the helmet to the head's height and includes controls for head and helmet scales, XYZ translations, and gap in a "Head / helmet fit" UI window. Save configuration and Load configuration use `fit_config.txt` in the project working directory. This aligns bounding boxes only, not anatomical surfaces.
+
 Then comes the lattice generation algorithm, 
 The algorithm will be different (probably completely different, based on the metamaterial, for example, some metamaterials already have a analytically defined function in xyz... so thats easy... but others are not so easy... )
 
@@ -17,4 +19,3 @@ Then, once the LGA is done, we can do some final post processing, get the final 
 
 
 From there the classic 3d printing method takes place... 
-

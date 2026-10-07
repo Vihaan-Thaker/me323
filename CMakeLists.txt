@@ -16,15 +16,18 @@ FetchContent_Declare(
 # We only need the viewer for now.
 set(LIBIGL_OPENGL ON CACHE BOOL "" FORCE)
 set(LIBIGL_GLFW ON CACHE BOOL "" FORCE)
+set(LIBIGL_IMGUI ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(libigl)
 
 add_executable(me323
     src/main.cpp
+    src/lattice_generator.cpp
 )
 
 target_link_libraries(me323
     PRIVATE
     igl::core
     igl::glfw
+    igl::imgui
 )

@@ -581,6 +581,36 @@ This is the central geometric problem.
 
 A lattice structure will be generated inside the available domain.
 
+The current prototype implements two implicit options in
+`src/lattice_generator.cpp`:
+
+-   **Auxetic:** a re-entrant honeycomb strut network repeated through the
+    third axis.
+-   **TPMS:** a gyroid sheet defined by its periodic implicit equation.
+
+Both are clipped to the signed-distance region between the fitted head and
+helmet. The input helmet surface is given a thin implicit skin, and a smooth
+head-facing liner is added so clipped struts do not end as exposed rods
+against the wearer. Both skins and the lattice are unioned into one sampled
+solid. Unit cells are phased from the combined model bounds (not world zero),
+and the lattice pitch is reduced when the sampled gap is narrower. Marching
+cubes extracts the result and the app writes `final_helmet_auxetic.stl` or
+`final_helmet_tpms.stl` in the current working directory. The TPMS case is
+generated when the app starts; either case can be regenerated from the
+viewer. The generated STL is shown in the viewer.
+
+Run `./build/me323` for the default TPMS case, or
+`./build/me323 --lattice auxetic` to generate and open the auxetic case
+on startup. Add `--generate-only` to export the selected case and exit without
+opening a viewer (useful for batch runs or automated checks).
+
+This is a first printable-mesh prototype, not a validated helmet design.
+The union is voxel-resampled, so surfaces and thin features are approximate;
+the source meshes must enclose meaningful volumes for signed-distance
+inside/outside classification. Inspect the exported STL in a slicer and
+validate its wall thickness, clearances, manifoldness, and mechanical
+performance before considering manufacture or wear.
+
 Possible lattice families can later include:
 
 -   cubic
