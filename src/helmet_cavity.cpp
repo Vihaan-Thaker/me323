@@ -2,6 +2,7 @@
 
 #include <igl/AABB.h>
 #include <igl/Hit.h>
+#include <igl/winding_number.h>
 
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
@@ -27,6 +28,16 @@ std::string percent(double fraction)
     return text;
 }
 
+// Unit vector through the centre of map cell (i, j).
+Eigen::RowVector3d cell_direction(double step, int i, int j)
+{
+    const double theta = (i + 0.5) * step;
+    const double phi = (j + 0.5) * step;
+    return Eigen::RowVector3d(
+        std::sin(theta) * std::cos(phi), std::cos(theta),
+        std::sin(theta) * std::sin(phi));
+}
+
 } // namespace
 
 double HelmetCavity::radius_at(int i, int j) const
@@ -50,14 +61,33 @@ double HelmetCavity::radius_at(int i, int j) const
     return radius[static_cast<std::size_t>(i) * n_phi + j];
 }
 
-double HelmetCavity::radial_distance(const Eigen::RowVector3d& p, double margin) const
+namespace
 {
-    const Eigen::RowVector3d d = p - centre;
-    const double r = d.norm();
+
+// The map cells around the direction of p, for bilinear interpolation.
+struct Corners
+{
+    double r;            // distance of p from the centre
+    double fi;
+    double fj;
+    double q[4];         // radii at (i0, j0), (i0+1, j0), (i0, j0+1), (i0+1, j0+1)
+
+    bool any_open() const
+    {
+        return std::isnan(q[0]) || std::isnan(q[1]) || std::isnan(q[2]) ||
+               std::isnan(q[3]);
+    }
+};
+
+Corners corners_of(const HelmetCavity& cavity, const Eigen::RowVector3d& p)
+{
+    const Eigen::RowVector3d d = p - cavity.centre;
+    Corners c{};
+    c.r = d.norm();
     // At the centre itself the direction is undefined; it lies inside the head,
     // so any inside answer will do.
-    const Eigen::RowVector3d u = r > 0.0 ? Eigen::RowVector3d(d / r)
-                                         : Eigen::RowVector3d(0.0, 1.0, 0.0);
+    const Eigen::RowVector3d u = c.r > 0.0 ? Eigen::RowVector3d(d / c.r)
+                                           : Eigen::RowVector3d(0.0, 1.0, 0.0);
     const double theta = std::acos(std::clamp(u.y(), -1.0, 1.0));
     double phi = std::atan2(u.z(), u.x());
     if (phi < 0.0)
@@ -66,25 +96,38 @@ double HelmetCavity::radial_distance(const Eigen::RowVector3d& p, double margin)
     }
 
     // Bilinear between the four surrounding cell centres.
-    const double ti = theta / step - 0.5;
-    const double pj = phi / step - 0.5;
+    const double ti = theta / cavity.step - 0.5;
+    const double pj = phi / cavity.step - 0.5;
     const int i0 = static_cast<int>(std::floor(ti));
     const int j0 = static_cast<int>(std::floor(pj));
-    const double fi = ti - i0;
-    const double fj = pj - j0;
-    const double r00 = radius_at(i0, j0);
-    const double r10 = radius_at(i0 + 1, j0);
-    const double r01 = radius_at(i0, j0 + 1);
-    const double r11 = radius_at(i0 + 1, j0 + 1);
+    c.fi = ti - i0;
+    c.fj = pj - j0;
+    c.q[0] = cavity.radius_at(i0, j0);
+    c.q[1] = cavity.radius_at(i0 + 1, j0);
+    c.q[2] = cavity.radius_at(i0, j0 + 1);
+    c.q[3] = cavity.radius_at(i0 + 1, j0 + 1);
+    return c;
+}
+
+} // namespace
+
+double HelmetCavity::radial_distance(const Eigen::RowVector3d& p, double margin) const
+{
+    const Corners c = corners_of(*this, p);
     // Any corner looking through the opening: treat the point as outside, so
     // lattice stops a fraction of a cell short of the rim instead of guessing.
-    if (std::isnan(r00) || std::isnan(r10) || std::isnan(r01) || std::isnan(r11))
+    if (c.any_open())
     {
         return open_distance;
     }
-    const double inner = (1.0 - fi) * (1.0 - fj) * r00 + fi * (1.0 - fj) * r10
-        + (1.0 - fi) * fj * r01 + fi * fj * r11;
-    return r - (inner - margin);
+    const double inner = (1.0 - c.fi) * (1.0 - c.fj) * c.q[0] + c.fi * (1.0 - c.fj) * c.q[1]
+        + (1.0 - c.fi) * c.fj * c.q[2] + c.fi * c.fj * c.q[3];
+    return c.r - (inner - margin);
+}
+
+bool HelmetCavity::covers(const Eigen::RowVector3d& p) const
+{
+    return !corners_of(*this, p).any_open();
 }
 
 bool build_helmet_cavity(
@@ -150,14 +193,11 @@ bool build_helmet_cavity(
         const double theta = (i + 0.5) * cavity.step;
         for (int j = 0; j < cavity.n_phi; ++j)
         {
-            const double phi = (j + 0.5) * cavity.step;
             const std::size_t cell = static_cast<std::size_t>(i) * cavity.n_phi + j;
             weight[cell] = std::sin(theta);
             total_weight += weight[cell];
 
-            const Eigen::RowVector3d direction(
-                std::sin(theta) * std::cos(phi), std::cos(theta),
-                std::sin(theta) * std::sin(phi));
+            const Eigen::RowVector3d direction = cell_direction(cavity.step, i, j);
             igl::Hit<double> hit;
             if (!tree.intersect_ray(scaled, helmet_faces, origin, direction, hit))
             {
@@ -342,6 +382,107 @@ bool build_helmet_cavity(
         {
             cavity.radius[vent_cells[k]] = filled[k];
         }
+    }
+    return true;
+}
+
+bool exclude_unscanned_directions(
+    HelmetCavity& cavity,
+    const Eigen::MatrixXd& head_vertices,
+    const Eigen::MatrixXi& head_faces,
+    const std::vector<bool>& lid,
+    std::string& error)
+{
+    if (head_vertices.rows() == 0 || head_faces.rows() == 0 ||
+        head_vertices.cols() != 3 || head_faces.cols() != 3 ||
+        !head_vertices.allFinite() ||
+        lid.size() != static_cast<std::size_t>(head_faces.rows()))
+    {
+        error = "Unscanned directions: empty or invalid head mesh or lid list.";
+        return false;
+    }
+    if (cavity.radius.empty() || cavity.n_theta <= 0 ||
+        cavity.radius.size() != static_cast<std::size_t>(cavity.n_theta) * cavity.n_phi)
+    {
+        error = "Unscanned directions: build the helmet cavity first.";
+        return false;
+    }
+    if (std::find(lid.begin(), lid.end(), true) == lid.end())
+    {
+        error = "Unscanned directions: no triangle is marked as lid.";
+        return false;
+    }
+
+    // Every ray from a point outside the head also meets the head, so hits
+    // alone prove nothing; the winding number does (+-1 inside, 0 outside).
+    const double winding =
+        igl::winding_number(head_vertices, head_faces, cavity.centre);
+    if (!(std::abs(winding) > 0.5))
+    {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%.2f", winding);
+        error = std::string("Unscanned directions: the head centre is not inside "
+                            "the closed head mesh (winding number ") + text + ").";
+        return false;
+    }
+
+    // Same reason as in build_helmet_cavity: cast against a copy scaled to a
+    // fixed size, so libigl's absolute ray epsilon can't hide small triangles.
+    const Eigen::RowVector3d vmin = head_vertices.colwise().minCoeff();
+    const Eigen::RowVector3d vmax = head_vertices.colwise().maxCoeff();
+    const double diagonal = (vmax - vmin).norm();
+    if (!(diagonal > 0.0) || !std::isfinite(diagonal))
+    {
+        error = "Unscanned directions: the head has zero size.";
+        return false;
+    }
+    const double scale = 1000.0 / diagonal;
+    const Eigen::MatrixXd scaled = head_vertices * scale;
+    const Eigen::RowVector3d origin = cavity.centre * scale;
+    igl::AABB<Eigen::MatrixXd, 3> tree;
+    tree.init(scaled, head_faces);
+
+    double total_weight = 0.0;
+    double unscanned_weight = 0.0;
+    double covered_weight = 0.0;
+    std::size_t still_covered = 0;
+    for (int i = 0; i < cavity.n_theta; ++i)
+    {
+        const double weight = std::sin((i + 0.5) * cavity.step);
+        for (int j = 0; j < cavity.n_phi; ++j)
+        {
+            const std::size_t cell = static_cast<std::size_t>(i) * cavity.n_phi + j;
+            total_weight += weight;
+            igl::Hit<double> hit;
+            if (!tree.intersect_ray(scaled, head_faces, origin,
+                                    cell_direction(cavity.step, i, j), hit))
+            {
+                error = "Unscanned directions: a ray from the head centre leaves "
+                        "without meeting the head, so the head mesh has a hole.";
+                return false;
+            }
+            if (lid[static_cast<std::size_t>(hit.id)])
+            {
+                unscanned_weight += weight;
+                if (!std::isnan(cavity.radius[cell]))
+                {
+                    covered_weight += weight;
+                    cavity.radius[cell] = std::numeric_limits<double>::quiet_NaN();
+                }
+            }
+            else if (!std::isnan(cavity.radius[cell]))
+            {
+                ++still_covered;
+            }
+        }
+    }
+    cavity.unscanned_fraction = unscanned_weight / total_weight;
+    cavity.unscanned_covered_fraction = covered_weight / total_weight;
+    if (still_covered == 0)
+    {
+        error = "Unscanned directions: no direction is both scanned and under the "
+                "helmet, so there is nowhere to build. Check the fit.";
+        return false;
     }
     return true;
 }

@@ -1,5 +1,6 @@
 #include "lattice_generator.h"
 
+#include "donning.h"
 #include "helmet_cavity.h"
 
 #include <igl/signed_distance.h>
@@ -27,6 +28,27 @@ std::string fixed1(double value)
 {
     char text[32];
     std::snprintf(text, sizeof(text), "%.1f", value);
+    return text;
+}
+
+std::string describe_lift_off(const LiftOff& lift)
+{
+    if (lift.tilt_degrees == 0.0 && lift.side_degrees == 0.0)
+    {
+        return "straight up";
+    }
+    std::string text = "up, tilted";
+    if (lift.tilt_degrees != 0.0)
+    {
+        text += " " + fixed1(std::abs(lift.tilt_degrees)) + " deg toward "
+            + (lift.tilt_degrees < 0.0 ? "-Z (the back of the head)" : "+Z (the face)");
+    }
+    if (lift.side_degrees != 0.0)
+    {
+        text += std::string(lift.tilt_degrees != 0.0 ? " and" : "") + " "
+            + fixed1(std::abs(lift.side_degrees)) + " deg toward "
+            + (lift.side_degrees < 0.0 ? "-X" : "+X");
+    }
     return text;
 }
 
@@ -519,6 +541,7 @@ bool compute_unsigned_distance(
 bool generate_final_helmet(
     const Eigen::MatrixXd& head_vertices,
     const Eigen::MatrixXi& head_faces,
+    const std::vector<bool>& head_lid,
     const Eigen::MatrixXd& helmet_vertices,
     const Eigen::MatrixXi& helmet_faces,
     LatticeType lattice_type,
@@ -531,6 +554,12 @@ bool generate_final_helmet(
         !head_vertices.allFinite() || !helmet_vertices.allFinite())
     {
         error = "Input head or helmet mesh is empty or invalid.";
+        return false;
+    }
+    if (!head_lid.empty() &&
+        head_lid.size() != static_cast<std::size_t>(head_faces.rows()))
+    {
+        error = "The head's lid list does not match its triangles.";
         return false;
     }
 
@@ -630,6 +659,24 @@ bool generate_final_helmet(
               << "% of directions); opening left open: "
               << fixed1(100.0 * cavity.open_fraction) << "%.\n";
 
+    // A scanned head ends at a rim closed by a lid. Directions that see only
+    // the lid get nothing, as the opening doesn't: liner and lattice stop at
+    // the rim instead of wrapping the lid, which sealed the helmet shut.
+    if (!head_lid.empty())
+    {
+        if (!exclude_unscanned_directions(
+                cavity, head_vertices, head_faces, head_lid, error))
+        {
+            return false;
+        }
+        std::cout << "  head scanned up to its rim: "
+                  << fixed1(100.0 * cavity.unscanned_fraction)
+                  << "% of directions see only its lid, "
+                  << fixed1(100.0 * cavity.unscanned_covered_fraction)
+                  << "% of all directions also under the helmet: left empty "
+                     "(head not measured there).\n";
+    }
+
     const double head_clearance = voxel_size;
     const double shell_thickness = std::max(
         voxel_size * 2.25, head_height * 0.01);
@@ -644,27 +691,174 @@ bool generate_final_helmet(
     // there is no skin; the lattice sits this far below the vent.
     const double cavity_margin = shell_thickness * 0.5;
 
-    // Computed once and reused by the main loop below.
+    // Computed once and reused below. `covered`: the direction is one to build
+    // in at all (helmet over it, head scanned), however far out the sample is.
     std::vector<double> inside_helmet(grid.sample_count());
-    double maximum_gap_half_width = 0.0;   // measured along rays: >= the true half-width
-    std::size_t domain_samples = 0;
+    std::vector<char> covered(grid.sample_count());
     for (std::size_t index = 0; index < grid.sample_count(); ++index)
     {
-        inside_helmet[index] =
-            cavity.radial_distance(grid_point(grid, index), cavity_margin);
-        const double outside_head = -head_distance[index] + head_clearance;
-        if (inside_helmet[index] < 0.0 && outside_head < 0.0)
+        const Eigen::RowVector3d p = grid_point(grid, index);
+        inside_helmet[index] = cavity.radial_distance(p, cavity_margin);
+        covered[index] = cavity.covers(p) ? 1 : 0;
+    }
+
+    // Getting it on. The helmet must slide off the head (and, reversed, on)
+    // without the head passing through any of it. Pick the direction the head
+    // blocks least, judged where material can end up: the lattice space, the
+    // liner (which can stand above the cavity under a vent) and the shell skin.
+    std::vector<std::size_t> material_samples;
+    std::vector<std::size_t> coarse;
+    for (std::size_t index = 0; index < grid.sample_count(); ++index)
+    {
+        const bool lattice_space =
+            inside_helmet[index] < 0.0 && head_distance[index] > head_clearance;
+        const bool liner_space = covered[index] &&
+            head_distance[index] > head_clearance &&
+            head_distance[index] < liner_center_distance + liner_thickness * 0.5;
+        const bool skin = helmet_surface_distance[index] < shell_thickness * 0.5;
+        if (!lattice_space && !liner_space && !skin)
+        {
+            continue;
+        }
+        const std::size_t x = index % grid.nx;
+        const std::size_t y = (index / grid.nx) % grid.ny;
+        const std::size_t z = index / (static_cast<std::size_t>(grid.nx) * grid.ny);
+        if (x % 4 == 0 && y % 4 == 0 && z % 4 == 0)
+        {
+            coarse.push_back(material_samples.size());
+        }
+        material_samples.push_back(index);
+    }
+    Eigen::MatrixXd material_points(
+        static_cast<Eigen::Index>(material_samples.size()), 3);
+    for (std::size_t k = 0; k < material_samples.size(); ++k)
+    {
+        material_points.row(static_cast<Eigen::Index>(k)) =
+            points.row(static_cast<Eigen::Index>(material_samples[k]));
+    }
+    std::cout << "Choosing the direction the helmet lifts off...\n";
+    LiftOff lift;
+    if (!choose_lift_off(
+            head_vertices, head_faces, material_points, coarse, lift, error))
+    {
+        return false;
+    }
+    const double material_count = static_cast<double>(material_samples.size());
+    std::cout << "  lifts off " << describe_lift_off(lift) << "; on along the reverse.\n"
+              << "  the head is in the way of "
+              << fixed1(100.0 * lift.blocked / material_count)
+              << "% of where material can go (lifting straight up: "
+              << fixed1(100.0 * lift.blocked_straight_up / material_count)
+              << "%); liner and lattice keep clear of it.\n";
+
+    // The shell is the stock helmet and is not trimmed, so only report it.
+    std::size_t skin_touching = 0;
+    std::size_t skin_in_the_way = 0;
+    for (std::size_t k = 0; k < material_samples.size(); ++k)
+    {
+        const std::size_t index = material_samples[k];
+        if (helmet_surface_distance[index] >= shell_thickness * 0.5)
+        {
+            continue;
+        }
+        if (head_distance[index] < head_clearance)
+        {
+            ++skin_touching;
+        }
+        else if (lift.is_blocked[k])
+        {
+            ++skin_in_the_way;
+        }
+    }
+    const double sample_volume = voxel_size * voxel_size * voxel_size;
+    if (skin_touching > 0)
+    {
+        std::cout << "  WARNING: the helmet shell comes within the head clearance of "
+                     "the head (" << skin_touching << " samples = "
+                  << static_cast<double>(skin_touching) * sample_volume
+                  << " model units cubed): the fit is tight there. Increase Gap.\n";
+    }
+    if (skin_in_the_way > 0)
+    {
+        std::cout << "  WARNING: the helmet shell itself is in the head's way when "
+                     "lifting off (" << skin_in_the_way << " samples = "
+                  << static_cast<double>(skin_in_the_way) * sample_volume
+                  << " model units cubed). It is not trimmed.\n";
+    }
+
+    // The swept head: the space the head passes through as the helmet lifts
+    // off. Liner and lattice are built against it instead of the head itself;
+    // wherever nothing overhangs the two are the same. Computed throughout the
+    // cavity, and in covered directions up to 7 voxels from the head (under a
+    // vent the liner can stand above the cavity). Elsewhere it stays the head
+    // distance, an upper bound: those samples lie in or beyond the shell wall,
+    // where no liner belongs and the skin covers any overlap.
+    std::vector<double> swept(
+        head_distance.data(), head_distance.data() + head_distance.size());
+    {
+        // Followed within the head's bounds widened by `margin`: further out
+        // the head is at least that far, and liner and lattice only use values
+        // up to liner_center_distance + liner_thickness / 2 (3 voxels).
+        const double margin = 7.0 * voxel_size;
+        const Eigen::RowVector3d grid_last =
+            grid.minimum + grid.step.cwiseProduct(Eigen::RowVector3d(
+                grid.nx - 1, grid.ny - 1, grid.nz - 1));
+        const Eigen::RowVector3d box_min = head_min.array() - margin;
+        const Eigen::RowVector3d box_max = head_max.array() + margin;
+        if (liner_center_distance + liner_thickness * 0.5 + voxel_size > margin ||
+            (box_min - grid.minimum).minCoeff() < 0.0 ||
+            (grid_last - box_max).minCoeff() < 0.0)
+        {
+            error = "Internal: the swept-head margin does not fit the grid.";
+            return false;
+        }
+        std::vector<std::size_t> near_cavity;
+        for (std::size_t index = 0; index < grid.sample_count(); ++index)
+        {
+            if (inside_helmet[index] < 2.0 * voxel_size ||
+                (covered[index] && head_distance[index] < margin))
+            {
+                near_cavity.push_back(index);
+            }
+        }
+        GridField field;
+        field.minimum = grid.minimum;
+        field.spacing = voxel_size;
+        field.nx = static_cast<int>(grid.nx);
+        field.ny = static_cast<int>(grid.ny);
+        field.nz = static_cast<int>(grid.nz);
+        field.values = head_distance.data();
+        swept_head_distance(
+            field, lift.direction, box_min, box_max, margin, near_cavity, swept);
+    }
+
+    double maximum_gap_half_width = 0.0;   // measured along rays: >= the true half-width
+    std::size_t domain_samples = 0;
+    std::size_t kept_clear = 0;
+    for (std::size_t index = 0; index < grid.sample_count(); ++index)
+    {
+        if (inside_helmet[index] >= 0.0)
+        {
+            continue;
+        }
+        const double outside_head = -swept[index] + head_clearance;
+        if (outside_head < 0.0)
         {
             ++domain_samples;
             maximum_gap_half_width = std::max(
                 maximum_gap_half_width,
                 std::min(-inside_helmet[index], -outside_head));
         }
+        else if (head_distance[index] > head_clearance)
+        {
+            ++kept_clear;
+        }
     }
     std::cout << "Space the lattice may fill: " << domain_samples << " samples = "
-              << static_cast<double>(domain_samples) * voxel_size * voxel_size
-                     * voxel_size
-              << " (model units cubed).\n";
+              << static_cast<double>(domain_samples) * sample_volume
+              << " (model units cubed); kept clear for lifting off: " << kept_clear
+              << " samples = " << static_cast<double>(kept_clear) * sample_volume
+              << ".\n";
     if (maximum_gap_half_width < voxel_size * 1.5)
     {
         error = "The fitted head and helmet leave less than three voxels of usable "
@@ -697,10 +891,14 @@ bool generate_final_helmet(
     {
         const double shell =
             std::abs(helmet_surface_distance[index]) - shell_thickness * 0.5;
-        const double inner_liner =
-            std::abs(head_distance[index] - liner_center_distance)
-            - liner_thickness * 0.5;
-        const double outside_head = -head_distance[index] + head_clearance;
+        // The liner follows the swept head, and only in directions the helmet
+        // covers where the head was scanned: it used to wrap the whole head,
+        // lid and all. Cut by direction only, not by distance: where it meets
+        // the shell the skin covers it, and under a vent it must not be holed.
+        const double inner_liner = covered[index]
+            ? std::abs(swept[index] - liner_center_distance) - liner_thickness * 0.5
+            : cavity.open_distance;
+        const double outside_head = -swept[index] + head_clearance;
         const double clipped_lattice = std::max({
             static_cast<double>(lattice_distance[index]),
             inside_helmet[index],

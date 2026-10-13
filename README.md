@@ -600,7 +600,31 @@ the shell to be star-shaped from the head centre, and generation stops with an
 error if it is not. The input helmet surface is given a thin implicit skin, and a smooth
 head-facing liner is added so clipped struts do not end as exposed rods
 against the wearer. Both skins and the lattice are unioned into one sampled
-solid. Unit cells are phased from the combined model bounds (not world zero),
+solid.
+
+The bottom stays open, so the helmet can be put on:
+
+-   **A scanned head ends at a rim.** `sfm/export_for_me323.py` closes it with
+    a lid (a fan of triangles) and records which triangles are lid in the
+    STL's 80-byte header: `ME323-HEAD v1 lid-faces <first> <count>`
+    (`src/head_lid.cpp` reads and checks it; a head without the marker, such
+    as the GrabCAD model, is treated as complete). Directions from the head
+    centre that see only the lid get no liner or lattice, just like the
+    opening: beyond the rim lies head nobody measured. The liner used to wrap
+    the whole head, lid included, which sealed the helmet shut.
+-   **The liner is cut by direction only:** it exists where the helmet covers
+    the head, vents included, however close the shell comes.
+-   **It has to slide on.** `src/donning.cpp` tries straight lift-off
+    directions (tilts up to 45 degrees forward/back, 10 sideways) and picks
+    the one the head blocks least. Liner and lattice are then built against
+    the space the head sweeps through along it, instead of the head itself,
+    so the back of the skull, which curves under, cannot hook them. For the
+    Run_2 scan, lifting straight up is blocked (about 6% of where material
+    can go); about 20 degrees toward the back is clear. The shell is the
+    stock helmet and is not trimmed; the program warns if it is in the way,
+    or if it comes within the head clearance (a fit that is too tight).
+
+Unit cells are phased from the combined model bounds (not world zero),
 and the lattice pitch is reduced when the sampled gap is narrower. Marching
 cubes extracts the result and the app writes `final_helmet_auxetic.stl` or
 `final_helmet_tpms.stl` in the current working directory. The TPMS case is
@@ -612,12 +636,15 @@ Run `./build/me323` for the default TPMS case, or
 on startup. Add `--generate-only` to export the selected case and exit without
 opening a viewer (useful for batch runs or automated checks). Add
 `--export-fit` to also write `fitted_head.stl` and `fitted_helmet.stl`, the
-exact meshes the generator received.
+exact meshes the generator received (the head keeps its lid marker).
 
 `tools/check_output.py` independently checks an output (Python with numpy,
-scipy, open3d; matplotlib for `--png`): it sorts the solid material into helmet
-skin, head-side liner, lattice inside the helmet, and material outside the
-helmet, and fails if more than 0.1% is outside:
+scipy, open3d; matplotlib for `--png`), with Open3D rather than libigl. It sorts
+the solid material into helmet skin, head-side liner, lattice inside the
+helmet, and material outside the helmet. Step 1 fails if more than 0.1% is
+outside the helmet. Step 2 fails if more than 0.1% is liner or lattice where
+the head was not scanned, liner where the helmet does not cover, or material
+the head passes through for the best straight lift-off direction:
 
 ``` bash
 ./build/me323 --lattice auxetic --generate-only --export-fit

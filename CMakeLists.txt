@@ -24,6 +24,8 @@ add_executable(me323
     src/main.cpp
     src/lattice_generator.cpp
     src/helmet_cavity.cpp
+    src/head_lid.cpp
+    src/donning.cpp
 )
 
 target_link_libraries(me323

@@ -32,7 +32,8 @@ struct HelmetCavity
     double step = 0.0;
 
     // Distance from the centre to the inner face, n_theta * n_phi, row-major
-    // in theta. NaN where the direction looks out through the opening.
+    // in theta. NaN where the direction looks out through the opening, and,
+    // after exclude_unscanned_directions(), where the head was not scanned.
     std::vector<double> radius;
 
     // Returned for directions that look through the opening: a large finite
@@ -46,6 +47,10 @@ struct HelmetCavity
     double open_fraction = 0.0;
     double largest_vent_fraction = 0.0;
     int vents_filled = 0;
+    // Set by exclude_unscanned_directions(): directions in which the head mesh
+    // has only its lid, and the part of those the helmet covers (now empty).
+    double unscanned_fraction = 0.0;
+    double unscanned_covered_fraction = 0.0;
 
     // |p - centre| - (r_inner(direction) - margin): negative inside the cavity,
     // stopping `margin` short of the inner face. Measured along the ray rather
@@ -53,6 +58,15 @@ struct HelmetCavity
     // point is the vent's edge, which made the alternative jump by up to 200 mm
     // across the boundary on the real helmet; this one changes smoothly.
     double radial_distance(const Eigen::RowVector3d& p, double margin) const;
+
+    // Whether the direction of p is one to build in: all four map cells around
+    // it have a radius (helmet over it, a bridged vent counting as helmet, and
+    // the head scanned there). radial_distance() returns open_distance exactly
+    // when this is false. Unlike radial_distance(), says nothing about how far
+    // out p is, which is what the liner needs: under a vent the bridged
+    // surface can sit lower than the liner, and cutting the liner there would
+    // punch a hole in it.
+    bool covers(const Eigen::RowVector3d& p) const;
 
     double radius_at(int i, int j) const;   // wraps j; i past a pole continues across it
 };
@@ -65,3 +79,17 @@ bool build_helmet_cavity(
     std::string& error,
     double resolution_degrees = 0.5,
     double max_vent_fraction = 0.05);
+
+// Leaves empty every direction in which the head was not scanned: those whose
+// ray from the centre leaves the head through a lid triangle (lid[f] true).
+// Beyond the scan's rim lies head nobody measured (forehead below the cap,
+// ears), and the lid slopes inward, so the space outside it is not free.
+// Marks those directions like the opening (NaN), so radial_distance() keeps
+// the lattice and covers() the liner out of them. Needs the centre inside the
+// closed head mesh, which it checks. Call after build_helmet_cavity().
+bool exclude_unscanned_directions(
+    HelmetCavity& cavity,
+    const Eigen::MatrixXd& head_vertices,
+    const Eigen::MatrixXi& head_faces,
+    const std::vector<bool>& lid,
+    std::string& error);

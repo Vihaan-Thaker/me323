@@ -13,6 +13,7 @@
 #include <iostream>
 #include <string>
 
+#include "head_lid.h"
 #include "lattice_generator.h"
 
 struct BoundingBox
@@ -296,6 +297,19 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // Which head triangles only close the scan. Read from the file afresh: the
+    // STL reader has consumed head_file.
+    HeadLid head_lid;
+    {
+        std::string error;
+        if (!read_head_lid("data/head.stl", V_head, F_head, head_lid, error))
+        {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << head_lid.note << '\n';
+    }
+
     const BoundingBox head = get_bbox(V_head);
     const BoundingBox helmet = get_bbox(V_helmet);
     if (head.size.y() <= 0.0 || helmet.size.y() <= 0.0)
@@ -388,22 +402,34 @@ int main(int argc, char** argv)
 
         // The exact head and helmet the generator receives, so external checks
         // (tools/check_output.py) use this geometry rather than re-deriving the
-        // fit. Written before generation, so they exist even if it fails.
-        if (export_fit &&
-            (!igl::writeSTL("fitted_head.stl", fitted_head, F_head,
-                            igl::FileEncoding::Binary) ||
-             !igl::writeSTL("fitted_helmet.stl", fitted_helmet, F_helmet,
-                            igl::FileEncoding::Binary)))
+        // fit. Written before generation, so they exist even if it fails. The
+        // head keeps its lid marker: triangle order is unchanged, so the
+        // marked range still holds.
+        if (export_fit)
         {
-            config_status = "Could not write fitted_head.stl / fitted_helmet.stl.";
-            std::cerr << config_status << '\n';
-            return false;
+            std::string header_error;
+            if (!igl::writeSTL("fitted_head.stl", fitted_head, F_head,
+                               igl::FileEncoding::Binary) ||
+                !igl::writeSTL("fitted_helmet.stl", fitted_helmet, F_helmet,
+                               igl::FileEncoding::Binary))
+            {
+                config_status = "Could not write fitted_head.stl / fitted_helmet.stl.";
+                std::cerr << config_status << '\n';
+                return false;
+            }
+            if (!head_lid.faces.empty() &&
+                !write_stl_header("fitted_head.stl", head_lid.header, header_error))
+            {
+                config_status = header_error;
+                std::cerr << config_status << '\n';
+                return false;
+            }
         }
 
         GeneratedMesh generated;
         std::string error;
         if (!generate_final_helmet(
-                fitted_head, F_head, fitted_helmet, F_helmet,
+                fitted_head, F_head, head_lid.faces, fitted_helmet, F_helmet,
                 type, generated, error))
         {
             config_status = error;
