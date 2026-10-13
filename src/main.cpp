@@ -212,12 +212,17 @@ int main(int argc, char** argv)
 {
     LatticeType startup_lattice = LatticeType::Gyroid;
     bool generate_only = false;
+    bool export_fit = false;
     for (int argument = 1; argument < argc; ++argument)
     {
         const std::string option = argv[argument];
         if (option == "--generate-only")
         {
             generate_only = true;
+        }
+        else if (option == "--export-fit")
+        {
+            export_fit = true;
         }
         else if (option == "--lattice" && argument + 1 < argc)
         {
@@ -235,7 +240,8 @@ int main(int argc, char** argv)
         }
         else
         {
-            std::cerr << "Usage: me323 [--lattice auxetic|tpms] [--generate-only]\n";
+            std::cerr << "Usage: me323 [--lattice auxetic|tpms] [--generate-only]"
+                         " [--export-fit]\n";
             return 2;
         }
     }
@@ -379,6 +385,20 @@ int main(int argc, char** argv)
             config.gap, config.head_scale, config.helmet_scale,
             config.head_translation, config.helmet_translation,
             fitted_head, fitted_helmet);
+
+        // The exact head and helmet the generator receives, so external checks
+        // (tools/check_output.py) use this geometry rather than re-deriving the
+        // fit. Written before generation, so they exist even if it fails.
+        if (export_fit &&
+            (!igl::writeSTL("fitted_head.stl", fitted_head, F_head,
+                            igl::FileEncoding::Binary) ||
+             !igl::writeSTL("fitted_helmet.stl", fitted_helmet, F_helmet,
+                            igl::FileEncoding::Binary)))
+        {
+            config_status = "Could not write fitted_head.stl / fitted_helmet.stl.";
+            std::cerr << config_status << '\n';
+            return false;
+        }
 
         GeneratedMesh generated;
         std::string error;

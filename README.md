@@ -588,8 +588,16 @@ The current prototype implements two implicit options in
     third axis.
 -   **TPMS:** a gyroid sheet defined by its periodic implicit equation.
 
-Both are clipped to the signed-distance region between the fitted head and
-helmet. The input helmet surface is given a thin implicit skin, and a smooth
+Both are clipped to the space between the fitted head and the inside of the
+helmet shell. "Inside the helmet" comes from a radius map built in
+`src/helmet_cavity.cpp`: rays from the head's centre record where they first
+meet the shell's inner face; small holes in that map (vents) are bridged with a
+smooth fill so lattice continues under them, and the one large hole (the
+opening the head goes through) is left open. The shell is open, so a signed
+distance to it has no meaningful inside; an earlier version used that sign plus
+the helmet's bounding box and filled the whole box with lattice. The map needs
+the shell to be star-shaped from the head centre, and generation stops with an
+error if it is not. The input helmet surface is given a thin implicit skin, and a smooth
 head-facing liner is added so clipped struts do not end as exposed rods
 against the wearer. Both skins and the lattice are unioned into one sampled
 solid. Unit cells are phased from the combined model bounds (not world zero),
@@ -602,7 +610,19 @@ viewer. The generated STL is shown in the viewer.
 Run `./build/me323` for the default TPMS case, or
 `./build/me323 --lattice auxetic` to generate and open the auxetic case
 on startup. Add `--generate-only` to export the selected case and exit without
-opening a viewer (useful for batch runs or automated checks).
+opening a viewer (useful for batch runs or automated checks). Add
+`--export-fit` to also write `fitted_head.stl` and `fitted_helmet.stl`, the
+exact meshes the generator received.
+
+`tools/check_output.py` independently checks an output (Python with numpy,
+scipy, open3d; matplotlib for `--png`): it sorts the solid material into helmet
+skin, head-side liner, lattice inside the helmet, and material outside the
+helmet, and fails if more than 0.1% is outside:
+
+``` bash
+./build/me323 --lattice auxetic --generate-only --export-fit
+python tools/check_output.py final_helmet_auxetic.stl fitted_head.stl fitted_helmet.stl --png slices.png
+```
 
 This is a first printable-mesh prototype, not a validated helmet design.
 The union is voxel-resampled, so surfaces and thin features are approximate;

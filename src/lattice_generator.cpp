@@ -1,5 +1,7 @@
 #include "lattice_generator.h"
 
+#include "helmet_cavity.h"
+
 #include <igl/signed_distance.h>
 
 #include <algorithm>
@@ -7,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <limits>
 #include <unordered_map>
@@ -18,6 +21,14 @@ namespace
 
 constexpr std::size_t max_grid_samples = 4'000'000;
 constexpr double pi = 3.14159265358979323846;
+
+// Formats without touching std::cout's own flags, which later output relies on.
+std::string fixed1(double value)
+{
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f", value);
+    return text;
+}
 
 bool has_closed_two_manifold_edges(
     const Eigen::MatrixXi& faces,
@@ -476,54 +487,30 @@ bool compute_signed_distance(
     return true;
 }
 
-bool compute_helmet_interior_distance(
+// Unsigned on purpose. The helmet is an open shell (rim, vents), so the side of
+// it a point lies on is not a meaningful question; the old pseudonormal sign
+// was also unreliable on the unwelded STL triangle soup. The shell skin only
+// needs the distance. Inside/outside comes from HelmetCavity instead.
+bool compute_unsigned_distance(
     const Eigen::MatrixXd& points,
-    const Eigen::MatrixXd& helmet_vertices,
-    const Eigen::MatrixXi& helmet_faces,
-    const Eigen::RowVector3d& interior_reference,
-    Eigen::VectorXd& signed_distances,
-    Eigen::VectorXd& interior_signed_distances,
-    std::string& error)
+    const Eigen::MatrixXd& vertices,
+    const Eigen::MatrixXi& faces,
+    Eigen::VectorXd& distances,
+    std::string& error,
+    const char* label)
 {
     Eigen::VectorXi closest_faces;
     Eigen::MatrixXd closest_points;
-    Eigen::MatrixXd unused_normals;
+    Eigen::MatrixXd unused_normals;   // not filled in UNSIGNED mode
     igl::signed_distance(
-        points, helmet_vertices, helmet_faces, igl::SIGNED_DISTANCE_TYPE_PSEUDONORMAL,
-        signed_distances, closest_faces, closest_points, unused_normals);
-    if (signed_distances.size() != points.rows() ||
-        !signed_distances.allFinite() || closest_points.rows() != points.rows() ||
-        closest_faces.size() != points.rows())
+        points, vertices, faces, igl::SIGNED_DISTANCE_TYPE_UNSIGNED,
+        distances, closest_faces, closest_points, unused_normals);
+    if (distances.size() != points.rows() || !distances.allFinite())
     {
-        error = "Could not compute a finite distance field for the helmet mesh.";
+        error = std::string("Could not compute a finite distance field for the ")
+            + label + " mesh.";
         return false;
     }
-
-    if (!unused_normals.allFinite())
-    {
-        error = "The helmet contains degenerate facets; signed distance is undefined.";
-        return false;
-    }
-    Eigen::MatrixXd reference_point(1, 3);
-    reference_point.row(0) = interior_reference;
-    Eigen::VectorXd reference_distance;
-    Eigen::VectorXi reference_face;
-    Eigen::MatrixXd reference_closest_point;
-    Eigen::MatrixXd reference_normal;
-    igl::signed_distance(
-        reference_point, helmet_vertices, helmet_faces,
-        igl::SIGNED_DISTANCE_TYPE_PSEUDONORMAL, reference_distance,
-        reference_face, reference_closest_point, reference_normal);
-    if (reference_distance.size() != 1 ||
-        !std::isfinite(reference_distance[0]) ||
-        std::abs(reference_distance[0]) <= 1e-8)
-    {
-        error = "The head center is too close to the helmet surface to determine "
-                "the interior side. Adjust the fit.";
-        return false;
-    }
-    const double interior_sign = reference_distance[0] < 0.0 ? 1.0 : -1.0;
-    interior_signed_distances = interior_sign * signed_distances;
     return true;
 }
 
@@ -551,8 +538,6 @@ bool generate_final_helmet(
     const Eigen::RowVector3d head_max = head_vertices.colwise().maxCoeff();
     const Eigen::RowVector3d helmet_min = helmet_vertices.colwise().minCoeff();
     const Eigen::RowVector3d helmet_max = helmet_vertices.colwise().maxCoeff();
-    const Eigen::RowVector3d helmet_center = (helmet_min + helmet_max) * 0.5;
-    const Eigen::RowVector3d helmet_half_size = (helmet_max - helmet_min) * 0.5;
     const Eigen::RowVector3d combined_min = head_min.cwiseMin(helmet_min);
     const Eigen::RowVector3d combined_max = head_max.cwiseMax(helmet_max);
     const double head_height = head_max.y() - head_min.y();
@@ -576,7 +561,10 @@ bool generate_final_helmet(
         grid.nz = static_cast<unsigned>(std::ceil(extent.z() / voxel_size)) + 1;
     };
     set_grid_dimensions();
-    if (grid.sample_count() > max_grid_samples)
+    // A loop, not a single correction: the grid has a fixed 8-voxel border on
+    // each side that the cube-root estimate ignores, so one pass can undershoot
+    // and the check below then fails (it did for any gap above ~10 mm).
+    while (grid.sample_count() > max_grid_samples)
     {
         const double adjustment = std::cbrt(
             static_cast<double>(grid.sample_count()) / max_grid_samples);
@@ -609,7 +597,6 @@ bool generate_final_helmet(
     }
 
     Eigen::VectorXd head_distance;
-    Eigen::VectorXd helmet_distance;
     Eigen::VectorXd helmet_surface_distance;
     std::cout << "Computing head signed-distance field...\n";
     if (!compute_signed_distance(
@@ -617,36 +604,67 @@ bool generate_final_helmet(
     {
         return false;
     }
-    std::cout << "Computing helmet surface-distance field...\n";
-    if (!compute_helmet_interior_distance(
-            points, helmet_vertices, helmet_faces,
-            (head_min + head_max) * 0.5,
-            helmet_surface_distance, helmet_distance, error))
+    std::cout << "Computing helmet distance field (unsigned)...\n";
+    if (!compute_unsigned_distance(
+            points, helmet_vertices, helmet_faces, helmet_surface_distance,
+            error, "helmet"))
     {
         return false;
     }
 
+    // "Inside the helmet" = inside the cavity mapped outward from the head's
+    // centre. Previously it was "not inside the shell wall and inside the
+    // helmet's bounding box", which filled the whole box with lattice.
+    std::cout << "Mapping the helmet cavity from the head centre...\n";
+    HelmetCavity cavity;
+    if (!build_helmet_cavity(
+            helmet_vertices, helmet_faces, (head_min + head_max) * 0.5,
+            cavity, error))
+    {
+        return false;
+    }
+    std::cout << "  shell's inner face met first along "
+              << fixed1(100.0 * cavity.inner_face_fraction) << "% of directions; "
+              << cavity.vents_filled << " vent(s) bridged (largest "
+              << fixed1(100.0 * cavity.largest_vent_fraction)
+              << "% of directions); opening left open: "
+              << fixed1(100.0 * cavity.open_fraction) << "%.\n";
+
     const double head_clearance = voxel_size;
-    double maximum_gap_half_width = 0.0;
+    const double shell_thickness = std::max(
+        voxel_size * 2.25, head_height * 0.01);
+    const double liner_thickness = std::max(
+        voxel_size * 2.0, head_height * 0.005);
+    const double liner_center_distance =
+        head_clearance + liner_thickness * 0.5;
+    // Lattice stops half a skin short of the shell's inner face, which is where
+    // the shell skin begins, so the two meet without a gap: the skin band is
+    // measured to the nearest shell point and the cut along the ray, and the
+    // along-ray distance is never the smaller of the two. Under a bridged vent
+    // there is no skin; the lattice sits this far below the vent.
+    const double cavity_margin = shell_thickness * 0.5;
+
+    // Computed once and reused by the main loop below.
+    std::vector<double> inside_helmet(grid.sample_count());
+    double maximum_gap_half_width = 0.0;   // measured along rays: >= the true half-width
+    std::size_t domain_samples = 0;
     for (std::size_t index = 0; index < grid.sample_count(); ++index)
     {
-        const unsigned x = static_cast<unsigned>(index % grid.nx);
-        const unsigned y = static_cast<unsigned>((index / grid.nx) % grid.ny);
-        const unsigned z = static_cast<unsigned>(
-            index / (static_cast<std::size_t>(grid.nx) * grid.ny));
-        const Eigen::RowVector3d point = grid.point(x, y, z);
-        const double helmet_bounds = (
-            (point - helmet_center).cwiseAbs() - helmet_half_size).maxCoeff();
-        const double inside_helmet = std::max(
-            helmet_distance[index], helmet_bounds);
+        inside_helmet[index] =
+            cavity.radial_distance(grid_point(grid, index), cavity_margin);
         const double outside_head = -head_distance[index] + head_clearance;
-        if (inside_helmet < 0.0 && outside_head < 0.0)
+        if (inside_helmet[index] < 0.0 && outside_head < 0.0)
         {
+            ++domain_samples;
             maximum_gap_half_width = std::max(
                 maximum_gap_half_width,
-                std::min(-inside_helmet, -outside_head));
+                std::min(-inside_helmet[index], -outside_head));
         }
     }
+    std::cout << "Space the lattice may fill: " << domain_samples << " samples = "
+              << static_cast<double>(domain_samples) * voxel_size * voxel_size
+                     * voxel_size
+              << " (model units cubed).\n";
     if (maximum_gap_half_width < voxel_size * 1.5)
     {
         error = "The fitted head and helmet leave less than three voxels of usable "
@@ -673,34 +691,19 @@ bool generate_final_helmet(
             grid, output.cell_size, lattice_anchor, lattice_distance);
     }
 
-    const double shell_thickness = std::max(
-        voxel_size * 2.25, head_height * 0.01);
-    const double liner_thickness = std::max(
-        voxel_size * 2.0, head_height * 0.005);
-    const double liner_center_distance =
-        head_clearance + liner_thickness * 0.5;
     Eigen::VectorXd final_distance(grid.sample_count());
     std::size_t lattice_samples = 0;
     for (std::size_t index = 0; index < grid.sample_count(); ++index)
     {
-        const unsigned x = static_cast<unsigned>(index % grid.nx);
-        const unsigned y = static_cast<unsigned>((index / grid.nx) % grid.ny);
-        const unsigned z = static_cast<unsigned>(
-            index / (static_cast<std::size_t>(grid.nx) * grid.ny));
-        const Eigen::RowVector3d point = grid.point(x, y, z);
-        const double helmet_bounds = (
-            (point - helmet_center).cwiseAbs() - helmet_half_size).maxCoeff();
         const double shell =
             std::abs(helmet_surface_distance[index]) - shell_thickness * 0.5;
         const double inner_liner =
             std::abs(head_distance[index] - liner_center_distance)
             - liner_thickness * 0.5;
-        const double inside_helmet = std::max(
-            helmet_distance[index], helmet_bounds);
         const double outside_head = -head_distance[index] + head_clearance;
         const double clipped_lattice = std::max({
             static_cast<double>(lattice_distance[index]),
-            inside_helmet,
+            inside_helmet[index],
             outside_head
         });
         if (clipped_lattice < 0.0)
